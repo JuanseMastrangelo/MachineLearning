@@ -1,0 +1,317 @@
+<html>
+
+<head>
+    <!-- Load TensorFlow.js -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.2"></script>
+    Load BodyPix
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix@2.0"></script>
+    <!-- <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/posenet"></script> -->
+
+</head>
+
+<body>
+    <video id="video" playsinline></video>
+    <canvas id="canvas"></canvas>
+    <div id="info"></div>
+</body>
+<!-- Place your code in the script tag below. You can also use an external .js file -->
+<script>
+    const COLOR = 'aqua';
+    const LINE_WIDTH = 2;
+    function drawPoint(ctx, y, x, r, color) {
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, 2 * Math.PI);
+        ctx.fillStyle = color;
+        ctx.fill();
+    }
+
+    function drawSegment([ay, ax], [by, bx], color, scale, ctx) {
+        ctx.beginPath();
+        ctx.moveTo(ax * scale, ay * scale);
+        ctx.lineTo(bx * scale, by * scale);
+        ctx.lineWidth = LINE_WIDTH;
+        ctx.strokeStyle = color;
+        ctx.stroke();
+    }
+
+    function drawSkeleton(keypoints, minConfidence, ctx, scale = 1) {
+        const adjacentKeyPoints =
+            posenet.getAdjacentKeyPoints(keypoints, minConfidence);
+
+        function toTuple({ y, x }) {
+            return [y, x];
+        }
+
+        adjacentKeyPoints.forEach((keypoints) => {
+            drawSegment(
+                toTuple(keypoints[0].position), toTuple(keypoints[1].position), COLOR,
+                scale, ctx);
+        });
+    }
+
+
+    function drawKeypoints(keypoints, minConfidence, ctx, scale = 1) {
+        for (let i = 0; i < keypoints.length; i++) {
+            const keypoint = keypoints[i];
+
+            if (keypoint.score < minConfidence) {
+                continue;
+            }
+
+            const { y, x } = keypoint.position;
+            drawPoint(ctx, y * scale, x * scale, 3, COLOR);
+        }
+    }
+    const state = {
+        video: null,
+        stream: null,
+        net: null,
+        videoConstraints: {},
+        // Triggers the TensorFlow model to reload
+        changingArchitecture: false,
+        changingMultiplier: false,
+        changingStride: false,
+        changingResolution: false,
+        changingQuantBytes: false,
+    };
+    const guiState = {
+        algorithm: 'multi-person-instance',
+        estimate: 'partmap',
+        camera: null,
+        flipHorizontal: false,
+        input: {
+            architecture: 'MobileNetV1',
+            outputStride: 16,
+            internalResolution: 'low',
+            multiplier: 0.50,
+            quantBytes: 2
+        },
+        multiPersonDecoding: {
+            maxDetections: 5,
+            scoreThreshold: 0.3,
+            nmsRadius: 20,
+            numKeypointForMatching: 17,
+            refineSteps: 10
+        },
+        segmentation: {
+            segmentationThreshold: 0.7,
+            effect: 'mask',
+            maskBackground: true,
+            opacity: 0.7,
+            backgroundBlurAmount: 3,
+            maskBlurAmount: 0,
+            edgeBlurAmount: 3
+        },
+        partMap: {
+            colorScale: 'rainbow',
+            effect: 'partMap',
+            segmentationThreshold: 0.5,
+            opacity: 0.9,
+            blurBodyPartAmount: 3,
+            bodyPartEdgeBlurAmount: 3,
+        },
+        showFps: false
+    };
+    async function getVideoInputs() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+            console.log('enumerateDevices() not supported.');
+            return [];
+        }
+
+        const devices = await navigator.mediaDevices.enumerateDevices();
+
+        const videoDevices = devices.filter(device => device.kind === 'videoinput');
+
+        return videoDevices;
+    }
+
+    function drawPoses(personOrPersonPartSegmentation, flipHorizontally, ctx) {
+        if (Array.isArray(personOrPersonPartSegmentation)) {
+            personOrPersonPartSegmentation.forEach(personSegmentation => {
+                let pose = personSegmentation.pose;
+                if (flipHorizontally) {
+                    pose = bodyPix.flipPoseHorizontal(pose, personSegmentation.width);
+                }
+                drawKeypoints(pose.keypoints, 0.1, ctx);
+                drawSkeleton(pose.keypoints, 0.1, ctx);
+            });
+        } else {
+            personOrPersonPartSegmentation.allPoses.forEach(pose => {
+                if (flipHorizontally) {
+                    pose = bodyPix.flipPoseHorizontal(
+                        pose, personOrPersonPartSegmentation.width);
+                }
+                drawKeypoints(pose.keypoints, 0.1, ctx);
+                drawSkeleton(pose.keypoints, 0.1, ctx);
+            })
+        }
+    }
+
+    async function estimateSegmentation() {
+        let multiPersonSegmentation = null;
+        switch (guiState.algorithm) {
+            case 'multi-person-instance':
+                return await state.net.segmentMultiPerson(state.video, {
+                    internalResolution: guiState.input.internalResolution,
+                    segmentationThreshold: guiState.segmentation.segmentationThreshold,
+                    maxDetections: guiState.multiPersonDecoding.maxDetections,
+                    scoreThreshold: guiState.multiPersonDecoding.scoreThreshold,
+                    nmsRadius: guiState.multiPersonDecoding.nmsRadius,
+                    numKeypointForMatching:
+                        guiState.multiPersonDecoding.numKeypointForMatching,
+                    refineSteps: guiState.multiPersonDecoding.refineSteps
+                });
+            case 'person':
+                return await state.net.segmentPerson(state.video, {
+                    internalResolution: guiState.input.internalResolution,
+                    segmentationThreshold: guiState.segmentation.segmentationThreshold,
+                    maxDetections: guiState.multiPersonDecoding.maxDetections,
+                    scoreThreshold: guiState.multiPersonDecoding.scoreThreshold,
+                    nmsRadius: guiState.multiPersonDecoding.nmsRadius,
+                });
+            default:
+                break;
+        };
+        return multiPersonSegmentation;
+    }
+
+    async function loadAndPredict() {
+        const canvas = document.getElementById('canvas');
+        async function bodySegmentationFrame() {
+            // const partSegmentation = await state.net.segmentPersonParts(state.video, {
+            // internalResolution: guiState.input.internalResolution,
+            // segmentationThreshold: guiState.segmentation.segmentationThreshold,
+            // maxDetections: guiState.multiPersonDecoding.maxDetections,
+            // scoreThreshold: guiState.multiPersonDecoding.scoreThreshold,
+            // nmsRadius: guiState.multiPersonDecoding.nmsRadius,
+            // });
+
+            // const backgroundBlurAmount = 3;
+            // const edgeBlurAmount = 3;
+            // const flipHorizontal = false;
+            // const faceBodyPartIdsToBlur = [0, 1];
+            // 
+            // 
+            // bodyPix.blurBodyPart(
+            // canvas, state.video, partSegmentation, faceBodyPartIdsToBlur,
+            // backgroundBlurAmount, edgeBlurAmount, flipHorizontal);
+
+
+            // const multiPersonSegmentation = await estimateSegmentation();
+            // const ctx = canvas.getContext('2d');
+            // const foregroundColor = { r: 255, g: 255, b: 255, a: 0 };
+            // const backgroundColor = { r: 0, g: 0, b: 0, a: 0 };
+            // const mask = bodyPix.toMask(
+            // multiPersonSegmentation, foregroundColor, backgroundColor,
+            // false);
+            // 
+            // 
+            // const flipHorizontally = guiState.flipHorizontal;
+            // bodyPix.drawMask(
+            // canvas, state.video, mask, guiState.segmentation.opacity,
+            // guiState.segmentation.maskBlurAmount, flipHorizontally);
+            // drawPoses(multiPersonSegmentation, flipHorizontally, ctx);
+
+
+
+            requestAnimationFrame(bodySegmentationFrame);
+        }
+
+        bodySegmentationFrame();
+    }
+
+    function stopExistingVideoCapture() {
+        if (state.video && state.video.srcObject) {
+            state.video.srcObject.getTracks().forEach(track => {
+                track.stop();
+            })
+            state.video.srcObject = null;
+        }
+    }
+
+    async function getConstraints(cameraLabel) {
+        let deviceId;
+        let facingMode;
+
+        if (cameraLabel) {
+            deviceId = await getDeviceIdForLabel(cameraLabel);
+            // on mobile, use the facing mode based on the camera.
+            facingMode = isMobile() ? getFacingMode(cameraLabel) : null;
+        };
+        return { deviceId, facingMode };
+    }
+
+    /**
+     * Loads a the camera to be used in the demo
+     *
+     */
+    async function setupCamera(cameraLabel) {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            throw new Error(
+                'Browser API navigator.mediaDevices.getUserMedia not available');
+        }
+
+        const videoElement = document.getElementById('video');
+
+        stopExistingVideoCapture();
+
+        const videoConstraints = await getConstraints(cameraLabel);
+
+        const stream = await navigator.mediaDevices.getUserMedia(
+            { 'audio': false, 'video': videoConstraints });
+        videoElement.srcObject = stream;
+
+        return new Promise((resolve) => {
+            videoElement.onloadedmetadata = () => {
+                videoElement.width = videoElement.videoWidth;
+                videoElement.height = videoElement.videoHeight;
+                resolve(videoElement);
+            };
+        });
+    }
+
+    async function loadVideo(cameraLabel) {
+        try {
+            state.video = await setupCamera(cameraLabel);
+        } catch (e) {
+            let info = document.getElementById('info');
+            info.textContent = 'this browser does not support video capture,' +
+                'or this device does not have a camera';
+            info.style.display = 'block';
+            throw e;
+        }
+
+        state.video.play();
+    }
+    async function loadBodyPix() {
+        state.net = await bodyPix.load({
+            architecture: guiState.input.architecture,
+            outputStride: guiState.input.outputStride,
+            multiplier: guiState.input.multiplier,
+            quantBytes: guiState.input.quantBytes
+        });
+    }
+
+
+    /**
+ * Kicks off the demo.
+ */
+    async function bindPage() {
+        // await loadBodyPix();
+        // Load the BodyPix model weights with architecture 0.75w
+        await loadVideo(guiState.camera);
+
+        let cameras = await getVideoInputs();
+
+
+        loadAndPredict();
+    }
+
+
+    navigator.getUserMedia = navigator.getUserMedia ||
+        navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+    // kick off the demo
+    bindPage();
+</script>
+
+</html>
